@@ -1,0 +1,317 @@
+import streamlit as st
+import os
+import uuid
+from ingestor.rag_system_manager import RAGSystemManager
+from ingestor.document_loader import DocumentProcessor
+from config import MODEL_CHOICES
+
+# --- configuration ---
+TEMP_DIR = "temp_files"
+if not os.path.exists(TEMP_DIR):
+    os.makedirs(TEMP_DIR)
+
+# --- Session state initialization ---
+if 'rag_manager' not in st.session_state:
+    st.session_state.rag_manager = None
+
+if 'ingested_docs' not in st.session_state:
+    st.session_state.ingested_docs = {}
+
+if 'evaluation_history' not in st.session_state:
+    st.session_state.evaluation_history = []
+
+def initialize_rag_manager(langsmith_key=None, langsmith_project=None):
+    """Initialize RAG manager with optional LangSmith credentials"""
+    try:
+        st.session_state.rag_manager = RAGSystemManager(
+            langsmith_api_key=langsmith_key,
+            langsmith_project=langsmith_project
+        )
+        return True
+    except Exception as e:
+        st.error(f"Failed to initialize RAGSystemManager: {e}")
+        return False
+
+def handle_ingestion(uploaded_files):
+    """saves uploaded files and calls the RAGManager's indexing function."""
+    doc_processor = DocumentProcessor()
+
+    for uploaded_file in uploaded_files:
+        doc_id = str(uuid.uuid4())[:8]
+        file_path = os.path.join(TEMP_DIR, uploaded_file.name)
+        file_content_bytes = uploaded_file.read()
+        with open(file_path, "wb") as f:
+            f.write(file_content_bytes)
+        uploaded_file.seek(0)
+
+        st.info(f"Processing {uploaded_file.name}...")
+        try:
+            chunks = doc_processor.load_and_split_document(
+                file_path=file_path, 
+                doc_id=doc_id, 
+                filename=uploaded_file.name
+            )
+            st.info(f"Split into {len(chunks)} chunks. Indexing...")
+            
+            st.session_state.rag_manager.index_document_chunks(chunks)
+            st.session_state.ingested_docs[doc_id] = uploaded_file.name
+            st.success(f"✓ Indexed {uploaded_file.name} (ID: {doc_id})")
+        except Exception as e:
+            st.error(f"Failed to process {uploaded_file.name}: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+    st.success(f"Successfully ingested {len(uploaded_files)} document(s).")
+    st.rerun()
+
+def handle_query(query, selected_doc_ids, api_choice, api_key, model_name, 
+                enable_eval, ground_truth, openai_eval_key):
+    """Executes the RAG query with optional evaluation."""
+    if not selected_doc_ids:
+        st.warning("Please select at least one document to query.")
+        return
+    
+    result = st.session_state.rag_manager.answer_query(
+        question=query,
+        doc_ids=selected_doc_ids,
+        api_choice=api_choice,
+        api_key=api_key,
+        model_name=model_name,
+        enable_evaluation=enable_eval,
+        ground_truth=ground_truth if ground_truth else None,
+        openai_eval_key = openai_eval_key
+    )
+
+    st.markdown("---")
+    st.markdown("### 🤖 RAG Answer")
+    st.info(result["answer"])
+    
+    # Show retrieved context count
+    st.caption(f"📚 Retrieved {result.get('retrieved_docs_count', 0)} relevant chunks")
+    
+    # Show evaluation scores if available
+    if "evaluation" in result and not result.get("error"):
+        st.markdown("### 📊 RAGAS Evaluation Scores")
+        
+        eval_data = result["evaluation"]
+        if "error" in eval_data:
+            st.error(f"Evaluation failed: {eval_data['error']}")
+        else:
+            cols = st.columns(len(eval_data))
+            for idx, (metric, score) in enumerate(eval_data.items()):
+                with cols[idx]:
+                    # Color code based on score
+                    if score >= 0.7:
+                        st.metric(metric, f"{score:.3f}", delta="Good", delta_color="normal")
+                    elif score >= 0.5:
+                        st.metric(metric, f"{score:.3f}", delta="Fair", delta_color="off")
+                    else:
+                        st.metric(metric, f"{score:.3f}", delta="Needs Improvement", delta_color="inverse")
+            
+            # Store in history
+            st.session_state.evaluation_history.append({
+                "question": query,
+                "answer": result["answer"],
+                "scores": eval_data
+            })
+
+st.set_page_config(page_title="Multi-Document RAG with Tracing & Evaluation", layout="wide")
+st.title("📄 Multi-Document RAG with LangSmith & RAGAS")
+
+# Sidebar for configuration
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    
+    # LangSmith Settings
+    with st.expander("🔍 LangSmith Tracing", expanded=False):
+        st.markdown("Enable tracing to debug and monitor your RAG pipeline")
+        langsmith_key = st.text_input(
+            "LangSmith API Key",
+            type="password",
+            help="Get your API key from https://smith.langchain.com"
+        )
+        langsmith_project = st.text_input(
+            "Project Name",
+            value="rag-evaluation",
+            help="Name for your LangSmith project"
+        )
+        
+        if st.button("Initialize with LangSmith"):
+            if initialize_rag_manager(langsmith_key, langsmith_project):
+                st.success("✓ RAG Manager initialized with LangSmith tracing!")
+            else:
+                st.error("Failed to initialize")
+    
+    # Initialize without LangSmith if not already done
+    if st.session_state.rag_manager is None:
+        if st.button("Initialize without LangSmith"):
+            if initialize_rag_manager():
+                st.success("✓ RAG Manager initialized!")
+
+    st.divider()
+    
+    # Evaluation Settings
+    with st.expander("📊 RAGAS Evaluation", expanded=False):
+        st.markdown("""
+        **RAGAS Metrics:**
+        - **Faithfulness**: Is the answer factually consistent with context?
+        - **Answer Relevancy**: Does the answer address the question?
+        - **Context Precision**: Are relevant contexts ranked higher?
+        - **Context Recall**: Are all relevant contexts retrieved?
+        
+        *Note: Precision & Recall require ground truth answers*
+        """)
+
+# Main content
+if st.session_state.rag_manager is None:
+    st.warning("⚠️ Please initialize the RAG Manager from the sidebar first!")
+    st.stop()
+
+## Document ingestion section
+with st.container():
+    st.header("1. Ingest Documents")
+    uploaded_files = st.file_uploader(
+        "Upload reports/Documents (PDF, TXT, etc.)",
+        type=["pdf", "txt", "docx", "html"],
+        accept_multiple_files=True
+    )
+
+    if uploaded_files and st.button("Index Documents"):
+        with st.spinner("Processing and Indexing Documents..."):
+            handle_ingestion(uploaded_files)
+
+# Display current ingested files
+if st.session_state.ingested_docs:
+    st.markdown("### Currently Indexed Documents")
+    doc_map = {doc_id: filename for doc_id, filename in st.session_state.ingested_docs.items()}
+    st.dataframe(
+        doc_map.items(),
+        column_order=["Document ID", "Filename"],
+        use_container_width=True
+    )
+    
+    # Add debug section
+    with st.expander("🔍 Debug: Collection Statistics"):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("Refresh Stats"):
+                stats = st.session_state.rag_manager.get_collection_stats()
+                st.json(stats)
+        with col_b:
+            if st.button("View Recent Logs"):
+                import glob
+                log_files = glob.glob("logs/*.log")
+                if log_files:
+                    latest_log = max(log_files, key=os.path.getctime)
+                    with open(latest_log, 'r') as f:
+                        logs = f.readlines()
+                        st.text_area("Recent Logs (last 50 lines)", 
+                                   value=''.join(logs[-50:]), 
+                                   height=400)
+                else:
+                    st.warning("No log files found")
+    
+    st.divider()
+
+# Query section
+st.header("2. Configure & Query")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    api_choice = st.selectbox(
+        "Select LLM provider",
+        list(MODEL_CHOICES.keys())[:-1],
+        key='api_choice_select'
+    )
+
+with col2:
+    api_key = st.text_input(
+        f"Enter {api_choice.upper()} API key",
+        type="password",
+        key='api_key_input'
+    )
+
+available_models = MODEL_CHOICES.get(api_choice, [])
+
+if available_models:
+    model_name = st.selectbox(
+        f"Select model for {api_choice.upper()}",
+        options=available_models,
+        index=available_models.index(MODEL_CHOICES['default'][api_choice]),
+        key="model_name_select"
+    )
+else:
+    model_name = st.text_input("Enter model name manually")
+
+if st.session_state.ingested_docs:
+    ingested_doc_ids = list(st.session_state.ingested_docs.keys())
+    selected_doc_ids = st.multiselect(
+        "Select document(s) for Query/Comparison (Select two or more to compare)",
+        options=ingested_doc_ids,
+        format_func=lambda x: st.session_state.ingested_docs[x],
+        default=ingested_doc_ids,
+        key='doc_select'
+    )
+
+    user_query = st.text_area("Ask your question or request a comparison", height=100)
+    
+    # Evaluation options
+    enable_eval = st.checkbox("Enable RAGAS Evaluation", value=False)
+
+    if enable_eval:
+        col_eval1, col_eval2 = st.columns(2)
+        
+        with col_eval1:
+            openai_eval_key = st.text_input(
+                "OpenAI API Key (for RAGAS)",
+                type="password",
+                help="RAGAS requires OpenAI API for evaluation metrics",
+                key='openai_eval_key'
+            )
+        
+        with col_eval2:
+            ground_truth = st.text_input(
+                "Ground Truth Answer (optional)",
+                help="Provide correct answer for precision/recall metrics"
+            )
+    else:
+        openai_eval_key = None
+        ground_truth = None
+
+    if st.button("🚀 Run RAG Query", type="primary"):
+        if not api_key or not model_name or not user_query:
+            st.error("Please ensure API key, model name and query are filled out.")
+        else:
+            with st.spinner(f"Running query with {api_choice.upper()}..."):
+                handle_query(user_query, selected_doc_ids, api_choice, api_key, 
+                           model_name, enable_eval, ground_truth, openai_eval_key)
+else:
+    st.warning("Please ingest documents in step 1 to enable querying.")
+
+# Evaluation History Section
+if st.session_state.evaluation_history:
+    st.divider()
+    st.header("📈 Evaluation History")
+    
+    # Get summary
+    summary = st.session_state.rag_manager.get_evaluation_summary()
+    
+    if "average_scores" in summary:
+        st.subheader(f"Average Scores ({summary['total_evaluations']} queries)")
+        
+        cols = st.columns(len(summary['average_scores']))
+        for idx, (metric, score) in enumerate(summary['average_scores'].items()):
+            with cols[idx]:
+                st.metric(metric.replace('_', ' ').title(), f"{score:.3f}")
+    
+    # Show detailed history
+    with st.expander("View All Evaluations"):
+        for idx, eval_result in enumerate(reversed(st.session_state.evaluation_history)):
+            st.markdown(f"**Query {len(st.session_state.evaluation_history) - idx}:** {eval_result['question']}")
+            st.caption(f"Answer: {eval_result['answer'][:200]}...")
+            st.json(eval_result['scores'])
+            st.divider()
