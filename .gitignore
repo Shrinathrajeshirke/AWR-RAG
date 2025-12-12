@@ -145,7 +145,7 @@ env.bak/
 venv.bak/
 .vscode
 rag_comparision_system/
-config.py
+
 
 
 # Spyder project settings
