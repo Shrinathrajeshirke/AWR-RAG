@@ -11,6 +11,5 @@ sentence-transformers
 streamlit
 langchain_qdrant
 ragas
-langsmith
 datasets
-python-magic-bin
+python-magic
