@@ -8,14 +8,10 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from config import EMBEDDING_MODEL_NAME, QDRANT_COLLECTION_NAME, QDRANT_LOCATION
-from llm_api.api_manager import get_llm  # <-- MISSING IMPORT
+from llm_api.api_manager import get_llm, get_openai_eval_llm # <-- ADDED get_openai_eval_llm
 from utils.logger import logging
 from utils.exception import CustomException
 from sentence_transformers import SentenceTransformer
-import langsmith
-
-from langsmith import Client
-from langsmith.run_helpers import traceable
 
 from ragas import evaluate
 from ragas.metrics import (
@@ -26,16 +22,18 @@ from ragas.metrics import (
 )
 from datasets import Dataset
 
+# Import for Qdrant filtering
+from qdrant_client.models import Filter, FieldCondition, MatchAny
+
 class RAGSystemManager:
     """ 
     The core object managing embeddings, Qdrant vector store, ingestion, 
-    retrieval filtering and the final RAG chain execution
+    retrieval filtering and the final RAG chain execution.
     """
 
-    def __init__(self, qdrant_location=QDRANT_LOCATION, collection_name=QDRANT_COLLECTION_NAME,
-                 langsmith_api_key=None, langsmith_project=None):
+    def __init__(self, qdrant_location=QDRANT_LOCATION, collection_name=QDRANT_COLLECTION_NAME):
         logging.info("="*50)
-        logging.info("Initializing RAG System Manager...")
+        logging.info("Initializing RAG System Manager (LangSmith disabled)...")
         logging.info(f"Qdrant location: {qdrant_location}")
         logging.info(f"Collection name: {collection_name}")
         logging.info(f"Embedding model: {EMBEDDING_MODEL_NAME}")
@@ -43,19 +41,6 @@ class RAGSystemManager:
         # Initialize evaluation results storage
         self.evaluation_results = []  
 
-        self.langsmith_enabled = False
-        if langsmith_api_key and langsmith_project:
-            try:
-                os.environ["LANGCHAIN_TRACING_V2"] = "true"
-                os.environ["LANGCHAIN_API_KEY"] = langsmith_api_key
-                os.environ["LANGCHAIN_PROJECT"] = langsmith_project
-                self.langsmith_client = Client(api_key=langsmith_api_key)
-                self.langsmith_enabled = True
-                logging.info("Langsmith tracing enabled")
-            except Exception as e:
-                logging.warning(f"Langsmith initialization failed: {e}")
-        else:
-            logging.info("Langsmith tracing disabled (no credentials provided)")
 
         try: 
             logging.info("Loading SentenceTransformer model...")
@@ -197,7 +182,7 @@ class RAGSystemManager:
         """
         vector_store = self.get_qdrant_vectorstore()
 
-        from qdrant_client.models import Filter, FieldCondition, MatchAny
+        # from qdrant_client.models import Filter, FieldCondition, MatchAny # Already imported
         
         logging.info(f"Creating retriever for doc_ids: {doc_ids}")
         
@@ -215,7 +200,6 @@ class RAGSystemManager:
             search_kwargs={"k": k, "filter": qdrant_filter}
         )
     
-    @traceable(name="RAG Query")
     def answer_query(self, question: str, doc_ids: list, api_choice: str, api_key: str, model_name: str,
                      enable_evaluation: bool = False, ground_truth: str = None, openai_eval_key: str = None) -> dict:  # <-- ALWAYS RETURN DICT
         """  
@@ -313,9 +297,9 @@ class RAGSystemManager:
         # Invoke and return the result
         try:
             logging.info("Invoking RAG chain...")
-            answer = rag_chain.invoke(question)  # <-- FIX: USE 'answer' NOT 'result'
+            answer = rag_chain.invoke(question)  
             logging.info("RAG chain executed successfully")
-            logging.info(f"Response length: {len(answer)} characters")  # <-- FIX: USE 'answer'
+            logging.info(f"Response length: {len(answer)} characters")  
 
             result = {
                 "answer": answer,
@@ -328,14 +312,23 @@ class RAGSystemManager:
             if enable_evaluation:
                 logging.info("Running RAGAS evaluation...")
 
-                # Set OpenAI API key for RAGAS (if using OpenAI)
+                # RAGAS REQUIRES AN OPENAI LLM (OR COMPATIBLE) FOR METRICS
                 if not openai_eval_key:
                     logging.error("No OpenAI API key provided for RAGAS evaluation")
                     result["evaluation"] = {"error": "OpenAI API key required for RAGAS evaluation"}
                     logging.info("="*50)
                     return result
 
-                os.environ["OPENAI_API_KEY"] = openai_eval_key
+                # Initialize dedicated LLM for RAGAS
+                try:
+                    ragas_llm = get_openai_eval_llm(openai_eval_key)
+                except Exception as e:
+                    logging.error(f"RAGAS LLM initialization failed: {e}")
+                    result["evaluation"] = {"error": f"RAGAS LLM initialization failed: {e}"}
+                    logging.info("="*50)
+                    return result
+
+
                 logging.info(f"Using OpenAI API for RAGAS evaluation")
 
                 eval_scores = self.evaluate_with_ragas(
@@ -343,6 +336,7 @@ class RAGSystemManager:
                     answer=answer,
                     contexts=contexts,
                     ground_truth=ground_truth,
+                    llm=ragas_llm # Pass the dedicated RAGAS LLM
                 )
                 result["evaluation"] = eval_scores
                 self.evaluation_results.append({
@@ -358,13 +352,16 @@ class RAGSystemManager:
         except Exception as e:
             logging.error(f"RAG Chain Invocation Failed: {e}", exc_info=True)
             logging.info("="*50)
-            raise CustomException(e, sys)
+            # Re-raise as CustomException for consistent error handling
+            raise CustomException(e, sys) 
 
     def evaluate_with_ragas(self, question: str, answer: str, contexts: list,
                             ground_truth: str = None, llm=None) -> dict:
         """  
         Evaluate RAG response using RAGAS metrics
         """
+        from ragas.llms import LangchainLLMWrapper # Local import for this function
+        
         try:
             # Prepare data for RAGAS
             data = {
@@ -389,20 +386,22 @@ class RAGSystemManager:
             if ground_truth:
                 metrics.extend([context_precision, context_recall])
 
-            
+            # RAGAS expects its own LLM wrapper for non-OpenAI LLMs, 
+            # or a direct OpenAI client. Here we pass a dedicated LangChain OpenAI LLM.
             result = evaluate(
                 dataset,
                 metrics=metrics,
-                #llm=LangchainLLMWrapper(llm),
+                llm=LangchainLLMWrapper(llm), # Wrap the dedicated OpenAI LLM for RAGAS
                 embeddings=self.embeddings,
                 
             )
             
-
             # Convert to dict and round scores
-            scores = {k: round(v, 4) for k, v in result.items()}
+            scores = result.to_pandas().iloc[0].to_dict()
 
-            return scores
+            scores_out = {k: round(v, 4) for k, v in scores.items() if isinstance(v, (int, float))}
+
+            return scores_out
         
         except Exception as e:
             logging.error(f"RAGAS evaluation failed: {e}", exc_info=True)
@@ -416,19 +415,21 @@ class RAGSystemManager:
         # Calculate average scores
         all_scores = {}
         for result in self.evaluation_results:
-            for metric, score in result["scores"].items():
-                if metric != "error":
-                    if metric not in all_scores:
-                        all_scores[metric] = []
-                    all_scores[metric].append(score)
+            # Check for "scores" key and ensure it's a dict
+            if isinstance(result, dict) and "scores" in result and isinstance(result["scores"], dict):
+                for metric, score in result["scores"].items():
+                    if metric != "error" and isinstance(score, (int, float)):
+                        if metric not in all_scores:
+                            all_scores[metric] = []
+                        all_scores[metric].append(score)
         
         avg_scores = {
-            metric: round(sum(scores) / len(scores), 4)  # <-- FIX: REMOVED EXTRA PAREN
+            metric: round(sum(scores) / len(scores), 4)
             for metric, scores in all_scores.items()
         }
 
         return {
-            "total_evaluations": len(self.evaluation_results),  # <-- FIX TYPO
+            "total_evaluations": len(self.evaluation_results),
             "average_scores": avg_scores,
             "all_results": self.evaluation_results
         }

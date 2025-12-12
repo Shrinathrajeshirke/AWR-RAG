@@ -20,13 +20,11 @@ if 'ingested_docs' not in st.session_state:
 if 'evaluation_history' not in st.session_state:
     st.session_state.evaluation_history = []
 
-def initialize_rag_manager(langsmith_key=None, langsmith_project=None):
-    """Initialize RAG manager with optional LangSmith credentials"""
+def initialize_rag_manager():
+    """Initialize RAG manager without optional LangSmith credentials"""
     try:
-        st.session_state.rag_manager = RAGSystemManager(
-            langsmith_api_key=langsmith_key,
-            langsmith_project=langsmith_project
-        )
+        # Initialized without LangSmith parameters
+        st.session_state.rag_manager = RAGSystemManager()
         return True
     except Exception as e:
         st.error(f"Failed to initialize RAGSystemManager: {e}")
@@ -87,6 +85,11 @@ def handle_query(query, selected_doc_ids, api_choice, api_key, model_name,
 
     st.markdown("---")
     st.markdown("### 🤖 RAG Answer")
+    
+    if result.get("error"):
+        st.error(f"Query Failed: {result['answer']}")
+        return
+
     st.info(result["answer"])
     
     # Show retrieved context count
@@ -101,60 +104,42 @@ def handle_query(query, selected_doc_ids, api_choice, api_key, model_name,
             st.error(f"Evaluation failed: {eval_data['error']}")
         else:
             cols = st.columns(len(eval_data))
-            for idx, (metric, score) in enumerate(eval_data.items()):
+            # Sort metrics to ensure consistent display order
+            sorted_metrics = sorted(eval_data.items(), key=lambda item: item[0])
+
+            for idx, (metric, score) in enumerate(sorted_metrics):
                 with cols[idx]:
                     # Color code based on score
                     if score >= 0.7:
-                        st.metric(metric, f"{score:.3f}", delta="Good", delta_color="normal")
+                        st.metric(metric.replace('_', ' ').title(), f"{score:.3f}", delta="Good", delta_color="normal")
                     elif score >= 0.5:
-                        st.metric(metric, f"{score:.3f}", delta="Fair", delta_color="off")
+                        st.metric(metric.replace('_', ' ').title(), f"{score:.3f}", delta="Fair", delta_color="off")
                     else:
-                        st.metric(metric, f"{score:.3f}", delta="Needs Improvement", delta_color="inverse")
+                        st.metric(metric.replace('_', ' ').title(), f"{score:.3f}", delta="Needs Improvement", delta_color="inverse")
             
-            # Store in history
-            st.session_state.evaluation_history.append({
-                "question": query,
-                "answer": result["answer"],
-                "scores": eval_data
-            })
+            # Store in history (handled inside RAGSystemManager now, but ensure consistency)
+            # The list append is now handled in rag_system_manager, so we can simplify the app logic
+            pass # Keep history as it is updated in RAGSystemManager
 
-st.set_page_config(page_title="Multi-Document RAG with Tracing & Evaluation", layout="wide")
-st.title("📄 Multi-Document RAG with LangSmith & RAGAS")
+st.set_page_config(page_title="Multi-Document RAG with Evaluation", layout="wide")
+st.title("📄 Multi-Document RAG with RAGAS Evaluation")
 
 # Sidebar for configuration
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    # LangSmith Settings
-    with st.expander("🔍 LangSmith Tracing", expanded=False):
-        st.markdown("Enable tracing to debug and monitor your RAG pipeline")
-        langsmith_key = st.text_input(
-            "LangSmith API Key",
-            type="password",
-            help="Get your API key from https://smith.langchain.com"
-        )
-        langsmith_project = st.text_input(
-            "Project Name",
-            value="rag-evaluation",
-            help="Name for your LangSmith project"
-        )
-        
-        if st.button("Initialize with LangSmith"):
-            if initialize_rag_manager(langsmith_key, langsmith_project):
-                st.success("✓ RAG Manager initialized with LangSmith tracing!")
-            else:
-                st.error("Failed to initialize")
-    
-    # Initialize without LangSmith if not already done
+    # Initialize RAG Manager section
     if st.session_state.rag_manager is None:
-        if st.button("Initialize without LangSmith"):
+        if st.button("Initialize RAG Manager"):
             if initialize_rag_manager():
                 st.success("✓ RAG Manager initialized!")
+            else:
+                st.error("Failed to initialize")
 
     st.divider()
     
     # Evaluation Settings
-    with st.expander("📊 RAGAS Evaluation", expanded=False):
+    with st.expander("📊 RAGAS Evaluation Info", expanded=False):
         st.markdown("""
         **RAGAS Metrics:**
         - **Faithfulness**: Is the answer factually consistent with context?
@@ -162,7 +147,7 @@ with st.sidebar:
         - **Context Precision**: Are relevant contexts ranked higher?
         - **Context Recall**: Are all relevant contexts retrieved?
         
-        *Note: Precision & Recall require ground truth answers*
+        *Note: Precision & Recall require ground truth answers. RAGAS requires an **OpenAI API Key** for all metrics.*
         """)
 
 # Main content
@@ -187,32 +172,33 @@ with st.container():
 if st.session_state.ingested_docs:
     st.markdown("### Currently Indexed Documents")
     doc_map = {doc_id: filename for doc_id, filename in st.session_state.ingested_docs.items()}
+    
+    # Create a list of tuples for better DataFrame display
+    doc_list = [(doc_id, filename) for doc_id, filename in doc_map.items()]
+
     st.dataframe(
-        doc_map.items(),
+        doc_list,
         column_order=["Document ID", "Filename"],
+        column_config={
+            0: st.column_config.TextColumn("Document ID", help="Unique 8-char identifier"),
+            1: st.column_config.TextColumn("Filename", help="Original uploaded file name")
+        },
+        hide_index=True,
         use_container_width=True
     )
     
     # Add debug section
     with st.expander("🔍 Debug: Collection Statistics"):
         col_a, col_b = st.columns(2)
+        
         with col_a:
-            if st.button("Refresh Stats"):
+            if st.button("Refresh Stats", key="refresh_stats"):
                 stats = st.session_state.rag_manager.get_collection_stats()
                 st.json(stats)
+        
         with col_b:
-            if st.button("View Recent Logs"):
-                import glob
-                log_files = glob.glob("logs/*.log")
-                if log_files:
-                    latest_log = max(log_files, key=os.path.getctime)
-                    with open(latest_log, 'r') as f:
-                        logs = f.readlines()
-                        st.text_area("Recent Logs (last 50 lines)", 
-                                   value=''.join(logs[-50:]), 
-                                   height=400)
-                else:
-                    st.warning("No log files found")
+            # Placeholder for log viewing (assuming 'logs' dir exists)
+            st.caption("Log viewing placeholder (check 'logs/' directory)")
     
     st.divider()
 
@@ -241,7 +227,8 @@ if available_models:
     model_name = st.selectbox(
         f"Select model for {api_choice.upper()}",
         options=available_models,
-        index=available_models.index(MODEL_CHOICES['default'][api_choice]),
+        # Ensure 'default' key and api_choice key exists for index access
+        index=available_models.index(MODEL_CHOICES['default'].get(api_choice, available_models[0])) if api_choice in MODEL_CHOICES['default'] and MODEL_CHOICES['default'][api_choice] in available_models else 0,
         key="model_name_select"
     )
 else:
@@ -269,14 +256,14 @@ if st.session_state.ingested_docs:
             openai_eval_key = st.text_input(
                 "OpenAI API Key (for RAGAS)",
                 type="password",
-                help="RAGAS requires OpenAI API for evaluation metrics",
+                help="RAGAS requires OpenAI API for evaluation metrics (e.g., gpt-4 or gpt-3.5-turbo)",
                 key='openai_eval_key'
             )
         
         with col_eval2:
             ground_truth = st.text_input(
                 "Ground Truth Answer (optional)",
-                help="Provide correct answer for precision/recall metrics"
+                help="Provide correct answer for context precision/recall metrics"
             )
     else:
         openai_eval_key = None
@@ -285,6 +272,8 @@ if st.session_state.ingested_docs:
     if st.button("🚀 Run RAG Query", type="primary"):
         if not api_key or not model_name or not user_query:
             st.error("Please ensure API key, model name and query are filled out.")
+        elif enable_eval and not openai_eval_key:
+             st.error("RAGAS Evaluation is enabled but the OpenAI API Key is missing.")
         else:
             with st.spinner(f"Running query with {api_choice.upper()}..."):
                 handle_query(user_query, selected_doc_ids, api_choice, api_key, 
@@ -304,7 +293,11 @@ if st.session_state.evaluation_history:
         st.subheader(f"Average Scores ({summary['total_evaluations']} queries)")
         
         cols = st.columns(len(summary['average_scores']))
-        for idx, (metric, score) in enumerate(summary['average_scores'].items()):
+        
+        # Sort metrics for consistent display
+        sorted_avg_scores = sorted(summary['average_scores'].items(), key=lambda item: item[0])
+        
+        for idx, (metric, score) in enumerate(sorted_avg_scores):
             with cols[idx]:
                 st.metric(metric.replace('_', ' ').title(), f"{score:.3f}")
     
