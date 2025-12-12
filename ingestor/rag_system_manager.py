@@ -400,7 +400,7 @@ class RAGSystemManager:
             scores = result.to_pandas().iloc[0].to_dict()
 
             scores_out = {k: round(v, 4) for k, v in scores.items() if isinstance(v, (int, float))}
-
+            logging.info(f"RAGAS Evaluation Scores for query: {scores_out}")
             return scores_out
         
         except Exception as e:

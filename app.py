@@ -4,6 +4,7 @@ import uuid
 from ingestor.rag_system_manager import RAGSystemManager
 from ingestor.document_loader import DocumentProcessor
 from config import MODEL_CHOICES
+from utils.email_utils import generate_report_content
 
 # --- configuration ---
 TEMP_DIR = "temp_files"
@@ -66,8 +67,9 @@ def handle_ingestion(uploaded_files):
     st.rerun()
 
 def handle_query(query, selected_doc_ids, api_choice, api_key, model_name, 
-                enable_eval, ground_truth, openai_eval_key):
-    """Executes the RAG query with optional evaluation."""
+                enable_eval, ground_truth, openai_eval_key, 
+                recipient_email, report_format):
+    """Executes the RAG query with optional evaluation and sends report via email."""
     if not selected_doc_ids:
         st.warning("Please select at least one document to query.")
         return
@@ -80,7 +82,7 @@ def handle_query(query, selected_doc_ids, api_choice, api_key, model_name,
         model_name=model_name,
         enable_evaluation=enable_eval,
         ground_truth=ground_truth if ground_truth else None,
-        openai_eval_key = openai_eval_key
+        openai_eval_key=openai_eval_key
     )
 
     st.markdown("---")
@@ -90,37 +92,87 @@ def handle_query(query, selected_doc_ids, api_choice, api_key, model_name,
         st.error(f"Query Failed: {result['answer']}")
         return
 
-    st.info(result["answer"])
+    final_answer = result["answer"]
+    retrieved_contexts = result.get("contexts", [])
     
+    st.success("Query successful!")
+    st.markdown(f"**Answer:**\n{final_answer}")
+
     # Show retrieved context count
     st.caption(f"📚 Retrieved {result.get('retrieved_docs_count', 0)} relevant chunks")
     
     # Show evaluation scores if available
-    if "evaluation" in result and not result.get("error"):
-        st.markdown("### 📊 RAGAS Evaluation Scores")
-        
-        eval_data = result["evaluation"]
-        if "error" in eval_data:
-            st.error(f"Evaluation failed: {eval_data['error']}")
-        else:
-            cols = st.columns(len(eval_data))
-            # Sort metrics to ensure consistent display order
-            sorted_metrics = sorted(eval_data.items(), key=lambda item: item[0])
-
-            for idx, (metric, score) in enumerate(sorted_metrics):
-                with cols[idx]:
-                    # Color code based on score
-                    if score >= 0.7:
-                        st.metric(metric.replace('_', ' ').title(), f"{score:.3f}", delta="Good", delta_color="normal")
-                    elif score >= 0.5:
-                        st.metric(metric.replace('_', ' ').title(), f"{score:.3f}", delta="Fair", delta_color="off")
-                    else:
-                        st.metric(metric.replace('_', ' ').title(), f"{score:.3f}", delta="Needs Improvement", delta_color="inverse")
-            
-            # Store in history (handled inside RAGSystemManager now, but ensure consistency)
-            # The list append is now handled in rag_system_manager, so we can simplify the app logic
-            pass # Keep history as it is updated in RAGSystemManager
-
+    if enable_eval and "evaluation" in result and not result.get("error"):
+        st.success("Evaluation completed and recorded internally for tracking.")
+        with st.expander("📊 View Evaluation Scores"):
+            st.json(result["evaluation"])
+    
+    # Generate and send report if email is provided
+    if recipient_email and recipient_email.strip():
+        with st.spinner(f"Generating {report_format.upper()} report and sending email..."):
+            try:
+                # Import email utilities
+                from utils.email_utils import generate_report_content, generate_pdf_report, send_email_report
+                
+                # Generate text and HTML content
+                text_content, html_content = generate_report_content(
+                    user_query=query,
+                    answer_markdown=final_answer,
+                    context=retrieved_contexts
+                )
+                
+                subject = f"RAG Query Report - {query[:50]}..."
+                
+                if report_format == "text":
+                    # Send plain text email
+                    success = send_email_report(
+                        to_email=recipient_email,
+                        subject=subject,
+                        body=text_content,
+                        subtype='plain'
+                    )
+                    
+                elif report_format == "html":
+                    # Send HTML email
+                    success = send_email_report(
+                        to_email=recipient_email,
+                        subject=subject,
+                        body=html_content,
+                        subtype='html'
+                    )
+                    
+                elif report_format == "pdf":
+                    # Generate PDF and send as attachment
+                    pdf_path = os.path.join(TEMP_DIR, f"rag_report_{uuid.uuid4().hex[:8]}.pdf")
+                    generate_pdf_report(
+                        user_query=query,
+                        answer_markdown=final_answer,
+                        context=retrieved_contexts,
+                        output_path=pdf_path
+                    )
+                    
+                    success = send_email_report(
+                        to_email=recipient_email,
+                        subject=subject,
+                        body="Please find the RAG query report attached as PDF.",
+                        subtype='plain',
+                        attachment_path=pdf_path
+                    )
+                    
+                    # Clean up PDF file
+                    if os.path.exists(pdf_path):
+                        os.remove(pdf_path)
+                
+                if success:
+                    st.success(f"Report sent successfully to {recipient_email} as {report_format.upper()}!")
+                else:
+                    st.warning(f"Report generated but email sending failed. Please check SMTP configuration in email_utils.py")
+                    
+            except Exception as e:
+                st.error(f"Error generating/sending report: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+    
 st.set_page_config(page_title="Multi-Document RAG with Evaluation", layout="wide")
 st.title("📄 Multi-Document RAG with RAGAS Evaluation")
 
@@ -269,6 +321,32 @@ if st.session_state.ingested_docs:
         openai_eval_key = None
         ground_truth = None
 
+    # Email report options
+    st.markdown("---")
+    st.subheader("📧 Email Report")
+    
+    col_email1, col_email2 = st.columns(2)
+    
+    with col_email1:
+        recipient_email = st.text_input(
+            "Recipient Email Address",
+            placeholder="user@example.com",
+            help="Enter email address to receive the report",
+            key='recipient_email'
+        )
+    
+    with col_email2:
+        report_format = st.selectbox(
+            "Report Format",
+            options=["pdf", "html", "text"],
+            index=0,
+            help="Choose the format for the email report",
+            key='report_format'
+        )
+    
+    if recipient_email:
+        st.info(f"📨 Report will be sent to: {recipient_email} as {report_format.upper()}")
+
     if st.button("🚀 Run RAG Query", type="primary"):
         if not api_key or not model_name or not user_query:
             st.error("Please ensure API key, model name and query are filled out.")
@@ -276,35 +354,17 @@ if st.session_state.ingested_docs:
              st.error("RAGAS Evaluation is enabled but the OpenAI API Key is missing.")
         else:
             with st.spinner(f"Running query with {api_choice.upper()}..."):
-                handle_query(user_query, selected_doc_ids, api_choice, api_key, 
-                           model_name, enable_eval, ground_truth, openai_eval_key)
+                handle_query(
+                    query=user_query,
+                    selected_doc_ids=selected_doc_ids,
+                    api_choice=api_choice,
+                    api_key=api_key,
+                    model_name=model_name,
+                    enable_eval=enable_eval,
+                    ground_truth=ground_truth,
+                    openai_eval_key=openai_eval_key,
+                    recipient_email=recipient_email if 'recipient_email' in locals() else "",
+                    report_format=report_format if 'report_format' in locals() else "pdf"
+                )
 else:
     st.warning("Please ingest documents in step 1 to enable querying.")
-
-# Evaluation History Section
-if st.session_state.evaluation_history:
-    st.divider()
-    st.header("📈 Evaluation History")
-    
-    # Get summary
-    summary = st.session_state.rag_manager.get_evaluation_summary()
-    
-    if "average_scores" in summary:
-        st.subheader(f"Average Scores ({summary['total_evaluations']} queries)")
-        
-        cols = st.columns(len(summary['average_scores']))
-        
-        # Sort metrics for consistent display
-        sorted_avg_scores = sorted(summary['average_scores'].items(), key=lambda item: item[0])
-        
-        for idx, (metric, score) in enumerate(sorted_avg_scores):
-            with cols[idx]:
-                st.metric(metric.replace('_', ' ').title(), f"{score:.3f}")
-    
-    # Show detailed history
-    with st.expander("View All Evaluations"):
-        for idx, eval_result in enumerate(reversed(st.session_state.evaluation_history)):
-            st.markdown(f"**Query {len(st.session_state.evaluation_history) - idx}:** {eval_result['question']}")
-            st.caption(f"Answer: {eval_result['answer'][:200]}...")
-            st.json(eval_result['scores'])
-            st.divider()

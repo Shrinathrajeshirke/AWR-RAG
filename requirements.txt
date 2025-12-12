@@ -12,4 +12,6 @@ streamlit
 langchain_qdrant
 ragas
 datasets
-python-magic
+reportlab>=4.0.0
+python-dotenv
+markdown
