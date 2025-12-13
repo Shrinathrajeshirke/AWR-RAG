@@ -24,7 +24,6 @@ if 'evaluation_history' not in st.session_state:
 def initialize_rag_manager():
     """Initialize RAG manager without optional LangSmith credentials"""
     try:
-        # Initialized without LangSmith parameters
         st.session_state.rag_manager = RAGSystemManager()
         return True
     except Exception as e:
@@ -54,7 +53,7 @@ def handle_ingestion(uploaded_files):
             
             st.session_state.rag_manager.index_document_chunks(chunks)
             st.session_state.ingested_docs[doc_id] = uploaded_file.name
-            st.success(f"✓ Indexed {uploaded_file.name} (ID: {doc_id})")
+            st.success(f"✅ Indexed {uploaded_file.name} (ID: {doc_id})")
         except Exception as e:
             st.error(f"Failed to process {uploaded_file.name}: {e}")
             import traceback
@@ -68,7 +67,7 @@ def handle_ingestion(uploaded_files):
 
 def handle_query(query, selected_doc_ids, api_choice, api_key, model_name, 
                 enable_eval, ground_truth, openai_eval_key, 
-                recipient_email, report_format):
+                recipient_email, report_format, prompt_style):
     """Executes the RAG query with optional evaluation and sends report via email."""
     if not selected_doc_ids:
         st.warning("Please select at least one document to query.")
@@ -82,7 +81,8 @@ def handle_query(query, selected_doc_ids, api_choice, api_key, model_name,
         model_name=model_name,
         enable_evaluation=enable_eval,
         ground_truth=ground_truth if ground_truth else None,
-        openai_eval_key=openai_eval_key
+        openai_eval_key=openai_eval_key,
+        prompt_style=prompt_style
     )
 
     st.markdown("---")
@@ -164,68 +164,46 @@ def handle_query(query, selected_doc_ids, api_choice, api_key, model_name,
                         os.remove(pdf_path)
                 
                 if success:
-                    st.success(f"Report sent successfully to {recipient_email} as {report_format.upper()}!")
+                    st.success(f"✅ Report sent successfully to {recipient_email} as {report_format.upper()}!")
                 else:
-                    st.warning(f"Report generated but email sending failed. Please check SMTP configuration in email_utils.py")
+                    st.warning(f"⚠️ Report generated but email sending failed. Please check SMTP configuration in email_utils.py")
                     
             except Exception as e:
                 st.error(f"Error generating/sending report: {e}")
                 import traceback
                 st.code(traceback.format_exc())
-    
+
+
 st.set_page_config(page_title="Multi-Document RAG with Evaluation", layout="wide")
 st.title("📄 Multi-Document RAG with RAGAS Evaluation")
 
-# Sidebar for configuration
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    
-    # Initialize RAG Manager section
-    if st.session_state.rag_manager is None:
-        if st.button("Initialize RAG Manager"):
-            if initialize_rag_manager():
-                st.success("✓ RAG Manager initialized!")
-            else:
-                st.error("Failed to initialize")
-
-    st.divider()
-    
-    # Evaluation Settings
-    with st.expander("📊 RAGAS Evaluation Info", expanded=False):
-        st.markdown("""
-        **RAGAS Metrics:**
-        - **Faithfulness**: Is the answer factually consistent with context?
-        - **Answer Relevancy**: Does the answer address the question?
-        - **Context Precision**: Are relevant contexts ranked higher?
-        - **Context Recall**: Are all relevant contexts retrieved?
-        
-        *Note: Precision & Recall require ground truth answers. RAGAS requires an **OpenAI API Key** for all metrics.*
-        """)
-
-# Main content
+# Auto-initialize RAG Manager if not initialized
 if st.session_state.rag_manager is None:
-    st.warning("⚠️ Please initialize the RAG Manager from the sidebar first!")
-    st.stop()
+    with st.spinner("🔄 Initializing RAG Manager..."):
+        if initialize_rag_manager():
+            st.success("✅ RAG Manager initialized successfully!")
+        else:
+            st.error("⚠️ Failed to initialize RAG Manager. Please check logs.")
+            st.stop()
 
-## Document ingestion section
+# Document ingestion section
 with st.container():
-    st.header("1. Ingest Documents")
+    st.header("1️⃣ Ingest Documents")
     uploaded_files = st.file_uploader(
         "Upload reports/Documents (PDF, TXT, etc.)",
         type=["pdf", "txt", "docx", "html"],
         accept_multiple_files=True
     )
 
-    if uploaded_files and st.button("Index Documents"):
+    if uploaded_files and st.button("📥 Index Documents"):
         with st.spinner("Processing and Indexing Documents..."):
             handle_ingestion(uploaded_files)
 
 # Display current ingested files
 if st.session_state.ingested_docs:
-    st.markdown("### Currently Indexed Documents")
+    st.markdown("### 📚 Currently Indexed Documents")
     doc_map = {doc_id: filename for doc_id, filename in st.session_state.ingested_docs.items()}
     
-    # Create a list of tuples for better DataFrame display
     doc_list = [(doc_id, filename) for doc_id, filename in doc_map.items()]
 
     st.dataframe(
@@ -244,18 +222,17 @@ if st.session_state.ingested_docs:
         col_a, col_b = st.columns(2)
         
         with col_a:
-            if st.button("Refresh Stats", key="refresh_stats"):
+            if st.button("🔄 Refresh Stats", key="refresh_stats"):
                 stats = st.session_state.rag_manager.get_collection_stats()
                 st.json(stats)
         
         with col_b:
-            # Placeholder for log viewing (assuming 'logs' dir exists)
-            st.caption("Log viewing placeholder (check 'logs/' directory)")
+            st.caption("📝 Log viewing placeholder (check 'logs/' directory)")
     
     st.divider()
 
 # Query section
-st.header("2. Configure & Query")
+st.header("2️⃣ Configure & Query")
 
 col1, col2 = st.columns(2)
 
@@ -279,7 +256,6 @@ if available_models:
     model_name = st.selectbox(
         f"Select model for {api_choice.upper()}",
         options=available_models,
-        # Ensure 'default' key and api_choice key exists for index access
         index=available_models.index(MODEL_CHOICES['default'].get(api_choice, available_models[0])) if api_choice in MODEL_CHOICES['default'] and MODEL_CHOICES['default'][api_choice] in available_models else 0,
         key="model_name_select"
     )
@@ -298,32 +274,61 @@ if st.session_state.ingested_docs:
 
     user_query = st.text_area("Ask your question or request a comparison", height=100)
     
-    # Evaluation options
-    enable_eval = st.checkbox("Enable RAGAS Evaluation", value=False)
+    st.markdown("---")
+    col_prompt1, col_prompt2 = st.columns([2, 1])
 
-    if enable_eval:
-        col_eval1, col_eval2 = st.columns(2)
+    with col_prompt1:
+        prompt_style = st.selectbox(
+            "🎨 Analysis Style",
+            options=["Standard", "Detailed Step-by-Step", "Issue-Focused"],
+            index=0,
+            help="Choose how the AI analyzes the documents"
+        )
+
+    with col_prompt2:
+        st.markdown("#### Style Guide")
+        if prompt_style == "Standard":
+            st.info("📝 Balanced analysis with clear structure")
+        elif prompt_style == "Detailed Step-by-Step":
+            st.info("🔍 Deep dive with reasoning at each step")
+        elif prompt_style == "Issue-Focused":
+            st.info("🎯 Executive summary with prioritized issues")
+
+    st.markdown("---")
+    # Evaluation options
+
+    with st.expander("📊 Advanced: RAGAS Evaluation (Optional)", expanded=False):
+        st.info("""
+        **RAGAS Metrics:** Faithfulness, Answer Relevancy, Context Precision, Context Recall
         
-        with col_eval1:
-            openai_eval_key = st.text_input(
-                "OpenAI API Key (for RAGAS)",
-                type="password",
-                help="RAGAS requires OpenAI API for evaluation metrics (e.g., gpt-4 or gpt-3.5-turbo)",
-                key='openai_eval_key'
-            )
+        *Note: Requires OpenAI API key*
+        """)
         
-        with col_eval2:
-            ground_truth = st.text_input(
-                "Ground Truth Answer (optional)",
-                help="Provide correct answer for context precision/recall metrics"
-            )
-    else:
-        openai_eval_key = None
-        ground_truth = None
+        enable_eval = st.checkbox("Enable RAGAS Evaluation", value=False)
+
+        if enable_eval:
+            col_eval1, col_eval2 = st.columns(2)
+            
+            with col_eval1:
+                openai_eval_key = st.text_input(
+                    "OpenAI API Key (for RAGAS)",
+                    type="password",
+                    help="RAGAS requires OpenAI API for evaluation metrics",
+                    key='openai_eval_key'
+                )
+            
+            with col_eval2:
+                ground_truth = st.text_input(
+                    "Ground Truth Answer (optional)",
+                    help="Provide correct answer for context precision/recall metrics"
+                )
+        else:
+            openai_eval_key = None
+            ground_truth = None
 
     # Email report options
     st.markdown("---")
-    st.subheader("📧 Email Report")
+    st.subheader("📧 Email Report (Optional)")
     
     col_email1, col_email2 = st.columns(2)
     
@@ -363,8 +368,9 @@ if st.session_state.ingested_docs:
                     enable_eval=enable_eval,
                     ground_truth=ground_truth,
                     openai_eval_key=openai_eval_key,
-                    recipient_email=recipient_email if 'recipient_email' in locals() else "",
-                    report_format=report_format if 'report_format' in locals() else "pdf"
+                    recipient_email=recipient_email if recipient_email else "",
+                    report_format=report_format if recipient_email else "pdf",
+                    prompt_style=prompt_style
                 )
 else:
-    st.warning("Please ingest documents in step 1 to enable querying.")
+    st.warning("⚠️ Please ingest documents in step 1 to enable querying.")

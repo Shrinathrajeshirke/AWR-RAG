@@ -8,7 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from config import EMBEDDING_MODEL_NAME, QDRANT_COLLECTION_NAME, QDRANT_LOCATION
-from llm_api.api_manager import get_llm, get_openai_eval_llm # <-- ADDED get_openai_eval_llm
+from llm_api.api_manager import get_llm, get_openai_eval_llm
 from utils.logger import logging
 from utils.exception import CustomException
 from sentence_transformers import SentenceTransformer
@@ -40,7 +40,6 @@ class RAGSystemManager:
 
         # Initialize evaluation results storage
         self.evaluation_results = []  
-
 
         try: 
             logging.info("Loading SentenceTransformer model...")
@@ -180,9 +179,12 @@ class RAGSystemManager:
         """  
         Creates a LangChain retriever filtered to only search within the specified document IDs
         """
+        if not doc_ids:
+            logging.warning("No doc_ids provided to get_filtered_retriever, using unfiltered retriever")
+            vector_store = self.get_qdrant_vectorstore()
+            return vector_store.as_retriever(search_type="similarity", search_kwargs={"k": k})
+        
         vector_store = self.get_qdrant_vectorstore()
-
-        # from qdrant_client.models import Filter, FieldCondition, MatchAny # Already imported
         
         logging.info(f"Creating retriever for doc_ids: {doc_ids}")
         
@@ -200,10 +202,200 @@ class RAGSystemManager:
             search_kwargs={"k": k, "filter": qdrant_filter}
         )
     
+    def _get_system_instruction(self, doc_ids: list, prompt_style: str) -> str:
+        """
+        Returns the appropriate system instruction based on prompt style and number of documents
+        """
+        
+        # Validate inputs
+        if not doc_ids:
+            logging.warning("No document IDs provided to _get_system_instruction")
+            doc_ids = ["Unknown"]
+        
+        if not prompt_style:
+            logging.warning("No prompt_style provided, defaulting to 'Standard'")
+            prompt_style = "Standard"
+        
+        # ============================================================
+        # MULTI-DOCUMENT COMPARISON PROMPTS
+        # ============================================================
+        if len(doc_ids) > 1:
+            if prompt_style == "Standard":
+                return (
+                    "You are an expert Oracle DBA with 20 years of experience analyzing AWR reports and performance data.\n\n"
+                    f"You are comparing multiple documents: {', '.join(doc_ids)}\n\n"
+                    "Analyze the retrieved context systematically:\n"
+                    "1. Identify key performance metrics from each document\n"
+                    "2. Compare and contrast the findings\n"
+                    "3. Highlight differences, trends, or improvements\n"
+                    "4. Point out any performance issues or anomalies\n"
+                    "5. Provide actionable recommendations if applicable\n\n"
+                    "IMPORTANT: Cite the Document ID (e.g., [doc_A]) for every specific data point.\n\n"
+                    "Format your response with clear sections and bullet points for readability."
+                )
+            
+            elif prompt_style == "Detailed Step-by-Step":
+                return (
+                    "You are an expert Oracle DBA comparing multiple AWR reports.\n\n"
+                    f"Documents to analyze: {', '.join(doc_ids)}\n\n"
+                    "Follow this analysis process:\n\n"
+                    "**STEP 1 - Extract Key Metrics:**\n"
+                    "For each document, list:\n"
+                    "- CPU usage (%)\n"
+                    "- DB Time\n"
+                    "- Top 3 Wait Events\n"
+                    "- Parse statistics\n"
+                    "- Top SQL by resource consumption\n\n"
+                    "**STEP 2 - Compare Metrics:**\n"
+                    "Create a comparison showing:\n"
+                    "- Which metrics improved?\n"
+                    "- Which metrics degraded?\n"
+                    "- What new issues appeared?\n\n"
+                    "**STEP 3 - Trend Analysis:**\n"
+                    "- Is performance improving or degrading overall?\n"
+                    "- What's causing the changes?\n\n"
+                    "**STEP 4 - Recommendations:**\n"
+                    "Based on the comparison, suggest:\n"
+                    "- Actions to address degrading metrics\n"
+                    "- What's working well to continue\n\n"
+                    "Always cite Document IDs (e.g., [doc_A], [doc_B]) for each data point."
+                )
+            
+            elif prompt_style == "Issue-Focused":
+                return (
+                    "You are an expert Oracle DBA performing comparative analysis.\n\n"
+                    f"Analyzing documents: {', '.join(doc_ids)}\n\n"
+                    "Provide a structured comparison:\n\n"
+                    "### 📊 EXECUTIVE SUMMARY\n"
+                    "Brief overview of what changed between reports.\n\n"
+                    "### 📈 METRIC COMPARISON TABLE\n"
+                    "| Metric | Doc 1 | Doc 2 | Change | Status |\n"
+                    "Present key metrics side-by-side.\n\n"
+                    "### 📴 NEW ISSUES (appeared in later reports)\n"
+                    "List any new problems that emerged.\n\n"
+                    "### ✅ RESOLVED ISSUES (fixed since earlier reports)\n"
+                    "List what improved.\n\n"
+                    "### 🟡 ONGOING ISSUES (persist across reports)\n"
+                    "List continuing problems.\n\n"
+                    "### 💡 RECOMMENDATIONS\n"
+                    "Based on trends, what actions should be taken?\n\n"
+                    "Always cite document IDs [doc_X] for specific values."
+                )
+        
+        # ============================================================
+        # SINGLE DOCUMENT ANALYSIS PROMPTS
+        # ============================================================
+        else:
+            if prompt_style == "Standard":
+                return (
+                    "You are an expert Oracle DBA with 20 years of experience analyzing AWR reports.\n\n"
+                    f"Analyze the AWR report from document [{doc_ids[0]}] systematically:\n\n"
+                    "**Step 1: Key Metrics Analysis**\n"
+                    "- Identify critical metrics (CPU, DB Time, Wait Events, etc.)\n"
+                    "- Compare against Oracle best practices\n\n"
+                    "**Step 2: Issue Identification**\n"
+                    "- List any metrics outside normal ranges\n"
+                    "- Categorize by severity (Critical/Warning/Info)\n\n"
+                    "**Step 3: Root Cause Analysis**\n"
+                    "- For each issue, explain the likely root cause\n"
+                    "- Reference specific evidence from the report\n\n"
+                    "**Step 4: Solutions**\n"
+                    "- Provide specific, actionable recommendations\n"
+                    "- Prioritize by impact (High/Medium/Low)\n"
+                    "- Include implementation effort (Easy/Medium/Hard)\n\n"
+                    "Be specific with metric values and cite the Document ID for your sources."
+                )
+            
+            elif prompt_style == "Detailed Step-by-Step":
+                return (
+                    "You are an expert Oracle DBA analyzing an AWR report.\n\n"
+                    f"Document: [{doc_ids[0]}]\n\n"
+                    "Analyze this AWR report step-by-step:\n\n"
+                    "**STEP 1 - Metric Extraction:**\n"
+                    "List the key metrics you find:\n"
+                    "- CPU usage and trend\n"
+                    "- DB Time breakdown\n"
+                    "- Top Wait Events (name and % of DB time)\n"
+                    "- Parse statistics (hard vs soft)\n"
+                    "- Buffer cache hit ratio\n"
+                    "- Top 3 SQL statements by elapsed time\n\n"
+                    "**STEP 2 - Threshold Comparison:**\n"
+                    "For each metric, compare against best practices:\n"
+                    "- CPU: Should be < 80%\n"
+                    "- Parse ratio: Hard parses < 10% of total\n"
+                    "- Buffer cache: Should be > 95%\n"
+                    "- Wait events: No single event should dominate > 50%\n\n"
+                    "**STEP 3 - Issue Identification:**\n"
+                    "List issues found:\n"
+                    "📴 CRITICAL: [issues requiring immediate attention]\n"
+                    "🟡 WARNING: [issues needing investigation]\n"
+                    "ℹ️ INFO: [observations and recommendations]\n\n"
+                    "**STEP 4 - Root Cause & Solutions:**\n"
+                    "For each issue:\n"
+                    "- Root Cause: [Why is this happening?]\n"
+                    "- Impact: [What's affected?]\n"
+                    "- Solution: [Specific steps to resolve]\n"
+                    "- Priority: [High/Medium/Low]\n"
+                    "- Effort: [Easy/Medium/Hard]\n\n"
+                    "Show your reasoning for each step. Be specific with values and cite document ID."
+                )
+            
+            elif prompt_style == "Issue-Focused":
+                return (
+                    "You are an expert Oracle DBA analyzing an AWR performance report.\n\n"
+                    f"Document: [{doc_ids[0]}]\n\n"
+                    "Provide a comprehensive analysis in this format:\n\n"
+                    "### 📊 EXECUTIVE SUMMARY\n"
+                    "One paragraph: Overall health, main findings, severity level.\n\n"
+                    "### 📴 CRITICAL ISSUES (Immediate Attention Required)\n"
+                    "For each critical issue:\n"
+                    "**Issue:** [Name]\n"
+                    "- **Metric:** [Specific value vs. expected]\n"
+                    "- **Root Cause:** [Why this is happening]\n"
+                    "- **Impact:** [What's affected]\n"
+                    "- **Solution:** [Specific fix with steps]\n"
+                    "- **Priority:** High | **Effort:** Easy/Medium/Hard\n\n"
+                    "### 🟡 WARNINGS (Investigation Recommended)\n"
+                    "[Same format as above]\n\n"
+                    "### ℹ️ OBSERVATIONS (Optimization Opportunities)\n"
+                    "[Same format as above]\n\n"
+                    "### 🎯 TOP 3 ACTION ITEMS\n"
+                    "1. [Most important action with expected result]\n"
+                    "2. [Second priority]\n"
+                    "3. [Third priority]\n\n"
+                    "### 📈 KEY METRICS SUMMARY\n"
+                    "- CPU Usage: [value and assessment]\n"
+                    "- DB Time: [value and assessment]\n"
+                    "- Top Wait Event: [name and % of time]\n"
+                    "- Buffer Cache Hit: [ratio and assessment]\n"
+                    "- Parse Efficiency: [hard/soft ratio]\n\n"
+                    "Be specific with numbers. Cite document ID for sources."
+                )
+        
+        # Fallback (should rarely reach here)
+        logging.warning(f"Unrecognized prompt_style: {prompt_style}. Using default.")
+        return "You are an expert DBA assistant. Answer based on the provided context."
+
+    
     def answer_query(self, question: str, doc_ids: list, api_choice: str, api_key: str, model_name: str,
-                     enable_evaluation: bool = False, ground_truth: str = None, openai_eval_key: str = None) -> dict:  # <-- ALWAYS RETURN DICT
+                     enable_evaluation: bool = False, ground_truth: str = None, openai_eval_key: str = None,
+                     prompt_style: str = "Standard") -> dict:
         """  
-        Executes the RAG chain for both single-document queries and multi-document comparisons
+        Executes the RAG chain for both single-document queries and multi-document comparisons.
+        
+        Args:
+            question: The user's question
+            doc_ids: List of document IDs to search within
+            api_choice: LLM API provider
+            api_key: API key for the LLM
+            model_name: Model name to use
+            enable_evaluation: Whether to run RAGAS evaluation
+            ground_truth: Ground truth answer for evaluation
+            openai_eval_key: OpenAI API key for RAGAS evaluation
+            prompt_style: Style of system prompt (Standard, Detailed Step-by-Step, Issue-Focused)
+        
+        Returns:
+            dict: Contains answer, contexts, and optionally evaluation scores
         """
         logging.info("="*50)
         logging.info("ANSWERING QUERY")
@@ -212,12 +404,21 @@ class RAGSystemManager:
         logging.info(f"LLM: {api_choice} - {model_name}")
         logging.info(f"Evaluation enabled: {enable_evaluation}")
         
+        # Validate inputs
+        if not question or not isinstance(question, str) or not question.strip():
+            logging.error("Invalid question provided")
+            return {"answer": "Error: Question cannot be empty", "error": True}
+        
+        if not doc_ids or not isinstance(doc_ids, list):
+            logging.error("Invalid doc_ids provided")
+            return {"answer": "Error: doc_ids must be a non-empty list", "error": True}
+        
         try:
             llm = get_llm(api_choice, api_key, model_name)
             logging.info("LLM initialized")
         except Exception as e:
             logging.error(f"LLM initialization failed: {e}")
-            return {"answer": f"LLM initialization Error: {e}", "error": True}  # <-- RETURN DICT
+            return {"answer": f"LLM initialization Error: {e}", "error": True}
         
         # Test retrieval first
         try:
@@ -241,13 +442,13 @@ class RAGSystemManager:
                 test_docs = retriever.invoke(question)
                 logging.info(f"Without filter, retrieved {len(test_docs)} documents")
                 
-            if not test_docs:
-                logging.error("No relevant documents found even without filter!")
-                return {
-                    "answer": " No relevant documents found",
-                    "contexts": [],
-                    "error": True
-                }
+                if not test_docs:
+                    logging.error("No relevant documents found even without filter!")
+                    return {
+                        "answer": "No relevant documents found in the collection",
+                        "contexts": [],
+                        "error": True
+                    }
                 
         except Exception as e:
             logging.error(f"Retrieval test failed: {e}", exc_info=True)
@@ -259,26 +460,14 @@ class RAGSystemManager:
         # Define prompt based on comparison requirement
         logging.info(f"Building RAG chain for {len(doc_ids)} document(s)...")
         
-        if len(doc_ids) > 1:
-            system_instruction = (
-                "You are an expert DBA, comparison and synthesis bot. The user has asked a question "
-                "about multiple reports. Analyze the retrieved context from "
-                f"documents {', '.join(doc_ids)} and provide a structured answer that **compares and contrasts** "
-                "the key points based on the user's question. You MUST cite the Document ID (e.g., [doc_A]) "
-                "for every specific data point you mention to show which report it came from."
-            )
-        else:
-            system_instruction = (
-                "You are an expert DBA assistant. Answer the user's question only "
-                "based on the provided context. If the answer is not in the context, state that. "
-                f"The context is from document {doc_ids[0]}. Cite the Document ID ([{doc_ids[0]}]) for your source."
-            )
-
+        system_instruction = self._get_system_instruction(doc_ids, prompt_style)
+        
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_instruction + "\n\nContext: {context}"),
             ("user", "{question}")
         ])
 
+        
         # Define the RAG chain
         def format_docs(docs):
             """ Formats retrieved documents for the LLM prompt """
@@ -328,7 +517,6 @@ class RAGSystemManager:
                     logging.info("="*50)
                     return result
 
-
                 logging.info(f"Using OpenAI API for RAGAS evaluation")
 
                 eval_scores = self.evaluate_with_ragas(
@@ -336,7 +524,7 @@ class RAGSystemManager:
                     answer=answer,
                     contexts=contexts,
                     ground_truth=ground_truth,
-                    llm=ragas_llm # Pass the dedicated RAGAS LLM
+                    llm=ragas_llm
                 )
                 result["evaluation"] = eval_scores
                 self.evaluation_results.append({
@@ -352,17 +540,30 @@ class RAGSystemManager:
         except Exception as e:
             logging.error(f"RAG Chain Invocation Failed: {e}", exc_info=True)
             logging.info("="*50)
-            # Re-raise as CustomException for consistent error handling
             raise CustomException(e, sys) 
 
     def evaluate_with_ragas(self, question: str, answer: str, contexts: list,
                             ground_truth: str = None, llm=None) -> dict:
         """  
-        Evaluate RAG response using RAGAS metrics
+        Evaluate RAG response using RAGAS metrics.
+        
+        Args:
+            question: The user's question
+            answer: The generated answer
+            contexts: List of retrieved context chunks
+            ground_truth: Optional ground truth answer
+            llm: LangChain LLM instance for evaluation
+        
+        Returns:
+            dict: RAGAS evaluation scores or error information
         """
-        from ragas.llms import LangchainLLMWrapper # Local import for this function
+        from ragas.llms import LangchainLLMWrapper
         
         try:
+            if not question or not answer or not contexts:
+                logging.warning("Missing required evaluation data")
+                return {"error": "Missing question, answer, or contexts for evaluation"}
+            
             # Prepare data for RAGAS
             data = {
                 "question": [question],
@@ -386,21 +587,23 @@ class RAGSystemManager:
             if ground_truth:
                 metrics.extend([context_precision, context_recall])
 
-            # RAGAS expects its own LLM wrapper for non-OpenAI LLMs, 
-            # or a direct OpenAI client. Here we pass a dedicated LangChain OpenAI LLM.
+            # RAGAS expects its own LLM wrapper
+            if not llm:
+                logging.error("No LLM provided for RAGAS evaluation")
+                return {"error": "LLM instance required for RAGAS evaluation"}
+
             result = evaluate(
                 dataset,
                 metrics=metrics,
-                llm=LangchainLLMWrapper(llm), # Wrap the dedicated OpenAI LLM for RAGAS
+                llm=LangchainLLMWrapper(llm),
                 embeddings=self.embeddings,
-                
             )
             
             # Convert to dict and round scores
             scores = result.to_pandas().iloc[0].to_dict()
-
             scores_out = {k: round(v, 4) for k, v in scores.items() if isinstance(v, (int, float))}
-            logging.info(f"RAGAS Evaluation Scores for query: {scores_out}")
+            
+            logging.info(f"RAGAS Evaluation Scores: {scores_out}")
             return scores_out
         
         except Exception as e:
@@ -408,24 +611,38 @@ class RAGSystemManager:
             return {"error": str(e)}
         
     def get_evaluation_summary(self) -> dict:
-        """Get summary of all evaluation results"""
+        """
+        Get summary of all evaluation results.
+        
+        Returns:
+            dict: Summary statistics and all evaluation results
+        """
         if not self.evaluation_results:
             return {"message": "No evaluations run yet"}
         
         # Calculate average scores
         all_scores = {}
         for result in self.evaluation_results:
-            # Check for "scores" key and ensure it's a dict
-            if isinstance(result, dict) and "scores" in result and isinstance(result["scores"], dict):
-                for metric, score in result["scores"].items():
-                    if metric != "error" and isinstance(score, (int, float)):
-                        if metric not in all_scores:
-                            all_scores[metric] = []
-                        all_scores[metric].append(score)
+            # Validate result structure
+            if not isinstance(result, dict):
+                logging.warning(f"Invalid result format: {type(result)}")
+                continue
+            
+            scores = result.get("scores", {})
+            if not isinstance(scores, dict):
+                logging.warning(f"Invalid scores format in result: {type(scores)}")
+                continue
+            
+            for metric, score in scores.items():
+                if metric != "error" and isinstance(score, (int, float)):
+                    if metric not in all_scores:
+                        all_scores[metric] = []
+                    all_scores[metric].append(score)
         
         avg_scores = {
             metric: round(sum(scores) / len(scores), 4)
             for metric, scores in all_scores.items()
+            if len(scores) > 0
         }
 
         return {
