@@ -44,3 +44,7 @@ RAGAS_METRICS = [
     "context_precision",
     "context_recall"
 ]
+
+RAGAS_ENABLED = True  # Always True for background evaluation
+RAGAS_OPENAI_KEY = None  # Set via environment variable
+RAGAS_LOG_ONLY = True  # Don't show in UI, only log

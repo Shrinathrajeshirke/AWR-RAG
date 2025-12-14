@@ -18,11 +18,11 @@ if 'rag_manager' not in st.session_state:
 if 'ingested_docs' not in st.session_state:
     st.session_state.ingested_docs = {}
 
-if 'evaluation_history' not in st.session_state:
-    st.session_state.evaluation_history = []
+if 'processed_files' not in st.session_state:
+    st.session_state.processed_files = set()
 
 def initialize_rag_manager():
-    """Initialize RAG manager without optional LangSmith credentials"""
+    """Initialize RAG manager"""
     try:
         st.session_state.rag_manager = RAGSystemManager()
         return True
@@ -31,12 +31,18 @@ def initialize_rag_manager():
         return False
 
 def handle_ingestion(uploaded_files):
-    """saves uploaded files and calls the RAGManager's indexing function."""
+    """Auto-index uploaded files"""
     doc_processor = DocumentProcessor()
 
     for uploaded_file in uploaded_files:
+        # Skip if already processed
+        if uploaded_file.name in st.session_state.processed_files:
+            continue
+            
         doc_id = str(uuid.uuid4())[:8]
         file_path = os.path.join(TEMP_DIR, uploaded_file.name)
+        
+        # Read file content
         file_content_bytes = uploaded_file.read()
         with open(file_path, "wb") as f:
             f.write(file_content_bytes)
@@ -53,6 +59,7 @@ def handle_ingestion(uploaded_files):
             
             st.session_state.rag_manager.index_document_chunks(chunks)
             st.session_state.ingested_docs[doc_id] = uploaded_file.name
+            st.session_state.processed_files.add(uploaded_file.name)
             st.success(f"✅ Indexed {uploaded_file.name} (ID: {doc_id})")
         except Exception as e:
             st.error(f"Failed to process {uploaded_file.name}: {e}")
@@ -62,12 +69,8 @@ def handle_ingestion(uploaded_files):
             if os.path.exists(file_path):
                 os.remove(file_path)
 
-    st.success(f"Successfully ingested {len(uploaded_files)} document(s).")
-    st.rerun()
-
 def handle_query(query, selected_doc_ids, api_choice, api_key, model_name, 
-                enable_eval, ground_truth, openai_eval_key, 
-                recipient_email, report_format, prompt_style):
+                recipient_email, report_format, prompt_style, ragas_enabled):
     """Executes the RAG query with optional evaluation and sends report via email."""
     if not selected_doc_ids:
         st.warning("Please select at least one document to query.")
@@ -79,10 +82,8 @@ def handle_query(query, selected_doc_ids, api_choice, api_key, model_name,
         api_choice=api_choice,
         api_key=api_key,
         model_name=model_name,
-        enable_evaluation=enable_eval,
-        ground_truth=ground_truth if ground_truth else None,
-        openai_eval_key=openai_eval_key,
-        prompt_style=prompt_style
+        prompt_style=prompt_style,
+        ragas_enabled=ragas_enabled
     )
 
     st.markdown("---")
@@ -101,49 +102,57 @@ def handle_query(query, selected_doc_ids, api_choice, api_key, model_name,
     # Show retrieved context count
     st.caption(f"📚 Retrieved {result.get('retrieved_docs_count', 0)} relevant chunks")
     
-    # Show evaluation scores if available
-    if enable_eval and "evaluation" in result and not result.get("error"):
-        st.success("Evaluation completed and recorded internally for tracking.")
-        with st.expander("📊 View Evaluation Scores"):
-            st.json(result["evaluation"])
+    # Show subtle indicator if RAGAS ran
+    if ragas_enabled and result.get("evaluation_completed"):
+        st.caption("📊 Quality evaluation completed (logged)")
     
     # Generate and send report if email is provided
     if recipient_email and recipient_email.strip():
         with st.spinner(f"Generating {report_format.upper()} report and sending email..."):
             try:
-                # Import email utilities
                 from utils.email_utils import generate_report_content, generate_pdf_report, send_email_report
                 
-                # Generate text and HTML content
-                text_content, html_content = generate_report_content(
-                    user_query=query,
-                    answer_markdown=final_answer,
-                    context=retrieved_contexts
-                )
-                
-                subject = f"RAG Query Report - {query[:50]}..."
+                subject = f"AWR Analysis Report - {query[:50]}..."
                 
                 if report_format == "text":
-                    # Send plain text email
+                    # Generate text content
+                    text_content, _ = generate_report_content(
+                        user_query=query,
+                        answer_markdown=final_answer,
+                        context=retrieved_contexts
+                    )
+                    
+                    # Send with text as attachment
                     success = send_email_report(
                         to_email=recipient_email,
                         subject=subject,
-                        body=text_content,
-                        subtype='plain'
+                        body="Please find the AWR analysis report attached.",
+                        subtype='plain',
+                        attachment_content=text_content,
+                        attachment_filename=f"awr_report_{uuid.uuid4().hex[:8]}.txt"
                     )
                     
                 elif report_format == "html":
-                    # Send HTML email
+                    # Generate HTML content
+                    _, html_content = generate_report_content(
+                        user_query=query,
+                        answer_markdown=final_answer,
+                        context=retrieved_contexts
+                    )
+                    
+                    # Send with HTML as attachment
                     success = send_email_report(
                         to_email=recipient_email,
                         subject=subject,
-                        body=html_content,
-                        subtype='html'
+                        body="Please find the AWR analysis report attached.",
+                        subtype='plain',
+                        attachment_content=html_content,
+                        attachment_filename=f"awr_report_{uuid.uuid4().hex[:8]}.html"
                     )
                     
                 elif report_format == "pdf":
-                    # Generate PDF and send as attachment
-                    pdf_path = os.path.join(TEMP_DIR, f"rag_report_{uuid.uuid4().hex[:8]}.pdf")
+                    # Generate PDF file
+                    pdf_path = os.path.join(TEMP_DIR, f"awr_report_{uuid.uuid4().hex[:8]}.pdf")
                     generate_pdf_report(
                         user_query=query,
                         answer_markdown=final_answer,
@@ -154,7 +163,7 @@ def handle_query(query, selected_doc_ids, api_choice, api_key, model_name,
                     success = send_email_report(
                         to_email=recipient_email,
                         subject=subject,
-                        body="Please find the RAG query report attached as PDF.",
+                        body="Please find the AWR analysis report attached as PDF.",
                         subtype='plain',
                         attachment_path=pdf_path
                     )
@@ -166,7 +175,7 @@ def handle_query(query, selected_doc_ids, api_choice, api_key, model_name,
                 if success:
                     st.success(f"✅ Report sent successfully to {recipient_email} as {report_format.upper()}!")
                 else:
-                    st.warning(f"⚠️ Report generated but email sending failed. Please check SMTP configuration in email_utils.py")
+                    st.warning(f"⚠️ Email sending failed. Please check SMTP configuration.")
                     
             except Exception as e:
                 st.error(f"Error generating/sending report: {e}")
@@ -174,8 +183,12 @@ def handle_query(query, selected_doc_ids, api_choice, api_key, model_name,
                 st.code(traceback.format_exc())
 
 
-st.set_page_config(page_title="Multi-Document RAG with Evaluation", layout="wide")
-st.title("📄 Multi-Document RAG with RAGAS Evaluation")
+# ============================================
+# MAIN APPLICATION UI
+# ============================================
+
+st.set_page_config(page_title="Oracle AWR RAG Application", layout="wide")
+st.title("📊 Oracle AWR RAG Application")
 
 # Auto-initialize RAG Manager if not initialized
 if st.session_state.rag_manager is None:
@@ -187,28 +200,31 @@ if st.session_state.rag_manager is None:
             st.stop()
 
 # Document ingestion section
-with st.container():
-    st.header("1️⃣ Ingest Documents")
-    uploaded_files = st.file_uploader(
-        "Upload reports/Documents (PDF, TXT, etc.)",
-        type=["pdf", "txt", "docx", "html"],
-        accept_multiple_files=True
-    )
+st.header("1️⃣ Upload & Index Documents")
+uploaded_files = st.file_uploader(
+    "Upload AWR Reports (PDF, TXT, DOCX, HTML)",
+    type=["pdf", "txt", "docx", "html"],
+    accept_multiple_files=True,
+    help="Documents will be automatically indexed upon upload"
+)
 
-    if uploaded_files and st.button("📥 Index Documents"):
-        with st.spinner("Processing and Indexing Documents..."):
-            handle_ingestion(uploaded_files)
+# Auto-index on upload
+if uploaded_files:
+    # Check for new files
+    new_files = [f for f in uploaded_files if f.name not in st.session_state.processed_files]
+    
+    if new_files:
+        with st.spinner(f"🔄 Auto-indexing {len(new_files)} new document(s)..."):
+            handle_ingestion(new_files)
+        st.rerun()
 
-# Display current ingested files
+# Display currently indexed documents
 if st.session_state.ingested_docs:
     st.markdown("### 📚 Currently Indexed Documents")
-    doc_map = {doc_id: filename for doc_id, filename in st.session_state.ingested_docs.items()}
-    
-    doc_list = [(doc_id, filename) for doc_id, filename in doc_map.items()]
+    doc_list = [(doc_id, filename) for doc_id, filename in st.session_state.ingested_docs.items()]
 
     st.dataframe(
         doc_list,
-        column_order=["Document ID", "Filename"],
         column_config={
             0: st.column_config.TextColumn("Document ID", help="Unique 8-char identifier"),
             1: st.column_config.TextColumn("Filename", help="Original uploaded file name")
@@ -216,18 +232,6 @@ if st.session_state.ingested_docs:
         hide_index=True,
         use_container_width=True
     )
-    
-    # Add debug section
-    with st.expander("🔍 Debug: Collection Statistics"):
-        col_a, col_b = st.columns(2)
-        
-        with col_a:
-            if st.button("🔄 Refresh Stats", key="refresh_stats"):
-                stats = st.session_state.rag_manager.get_collection_stats()
-                st.json(stats)
-        
-        with col_b:
-            st.caption("📝 Log viewing placeholder (check 'logs/' directory)")
     
     st.divider()
 
@@ -265,16 +269,23 @@ else:
 if st.session_state.ingested_docs:
     ingested_doc_ids = list(st.session_state.ingested_docs.keys())
     selected_doc_ids = st.multiselect(
-        "Select document(s) for Query/Comparison (Select two or more to compare)",
+        "Select document(s) for Query/Comparison",
         options=ingested_doc_ids,
         format_func=lambda x: st.session_state.ingested_docs[x],
         default=ingested_doc_ids,
+        help="Select two or more documents to compare",
         key='doc_select'
     )
 
-    user_query = st.text_area("Ask your question or request a comparison", height=100)
+    user_query = st.text_area(
+        "Ask your question or request a comparison", 
+        height=100,
+        placeholder="e.g., 'Analyze this AWR report and identify performance issues'"
+    )
     
     st.markdown("---")
+    
+    # Analysis Style Selection
     col_prompt1, col_prompt2 = st.columns([2, 1])
 
     with col_prompt1:
@@ -295,39 +306,29 @@ if st.session_state.ingested_docs:
             st.info("🎯 Executive summary with prioritized issues")
 
     st.markdown("---")
-    # Evaluation options
+    
+    # RAGAS Toggle - Option 1: Simple Toggle (Recommended)
+    col_ragas1, col_ragas2 = st.columns([3, 1])
 
-    with st.expander("📊 Advanced: RAGAS Evaluation (Optional)", expanded=False):
-        st.info("""
-        **RAGAS Metrics:** Faithfulness, Answer Relevancy, Context Precision, Context Recall
-        
-        *Note: Requires OpenAI API key*
-        """)
-        
-        enable_eval = st.checkbox("Enable RAGAS Evaluation", value=False)
+    with col_ragas1:
+        ragas_enabled = st.toggle(
+            "📊 Enable Background Quality Evaluation (RAGAS)",
+            value=True,  # Default ON
+            help="Evaluates answer quality in background. Scores are logged for internal tracking."
+        )
 
-        if enable_eval:
-            col_eval1, col_eval2 = st.columns(2)
-            
-            with col_eval1:
-                openai_eval_key = st.text_input(
-                    "OpenAI API Key (for RAGAS)",
-                    type="password",
-                    help="RAGAS requires OpenAI API for evaluation metrics",
-                    key='openai_eval_key'
-                )
-            
-            with col_eval2:
-                ground_truth = st.text_input(
-                    "Ground Truth Answer (optional)",
-                    help="Provide correct answer for context precision/recall metrics"
-                )
+    with col_ragas2:
+        if ragas_enabled:
+            st.success("✅ Active")
         else:
-            openai_eval_key = None
-            ground_truth = None
+            st.info("⏸️ Disabled")
 
-    # Email report options
+    if ragas_enabled:
+        st.caption("ℹ️ Quality metrics will be logged for internal analysis. No impact on response time.")
+    
     st.markdown("---")
+    
+    # Email report options
     st.subheader("📧 Email Report (Optional)")
     
     col_email1, col_email2 = st.columns(2)
@@ -352,11 +353,10 @@ if st.session_state.ingested_docs:
     if recipient_email:
         st.info(f"📨 Report will be sent to: {recipient_email} as {report_format.upper()}")
 
-    if st.button("🚀 Run RAG Query", type="primary"):
+    # Run Query Button
+    if st.button("🚀 Run RAG Query", type="primary", use_container_width=True):
         if not api_key or not model_name or not user_query:
-            st.error("Please ensure API key, model name and query are filled out.")
-        elif enable_eval and not openai_eval_key:
-             st.error("RAGAS Evaluation is enabled but the OpenAI API Key is missing.")
+            st.error("⚠️ Please ensure API key, model name and query are filled out.")
         else:
             with st.spinner(f"Running query with {api_choice.upper()}..."):
                 handle_query(
@@ -365,12 +365,14 @@ if st.session_state.ingested_docs:
                     api_choice=api_choice,
                     api_key=api_key,
                     model_name=model_name,
-                    enable_eval=enable_eval,
-                    ground_truth=ground_truth,
-                    openai_eval_key=openai_eval_key,
                     recipient_email=recipient_email if recipient_email else "",
                     report_format=report_format if recipient_email else "pdf",
-                    prompt_style=prompt_style
+                    prompt_style=prompt_style,
+                    ragas_enabled=ragas_enabled
                 )
 else:
-    st.warning("⚠️ Please ingest documents in step 1 to enable querying.")
+    st.warning("⚠️ Please upload and index documents in step 1 to enable querying.")
+
+# Footer
+st.markdown("---")
+st.caption("Oracle AWR RAG Application | Powered by LangChain, Qdrant & Advanced LLMs")

@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime
 from langchain_qdrant import QdrantVectorStore
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
@@ -10,6 +11,7 @@ from langchain_core.output_parsers import StrOutputParser
 from config import EMBEDDING_MODEL_NAME, QDRANT_COLLECTION_NAME, QDRANT_LOCATION
 from llm_api.api_manager import get_llm, get_openai_eval_llm
 from utils.logger import logging
+from utils.ragas import ragas_logger
 from utils.exception import CustomException
 from sentence_transformers import SentenceTransformer
 
@@ -25,6 +27,13 @@ from datasets import Dataset
 # Import for Qdrant filtering
 from qdrant_client.models import Filter, FieldCondition, MatchAny
 
+# Try to import streamlit for secrets (optional)
+try:
+    import streamlit as st
+    STREAMLIT_AVAILABLE = True
+except ImportError:
+    STREAMLIT_AVAILABLE = False
+
 class RAGSystemManager:
     """ 
     The core object managing embeddings, Qdrant vector store, ingestion, 
@@ -33,7 +42,7 @@ class RAGSystemManager:
 
     def __init__(self, qdrant_location=QDRANT_LOCATION, collection_name=QDRANT_COLLECTION_NAME):
         logging.info("="*50)
-        logging.info("Initializing RAG System Manager (LangSmith disabled)...")
+        logging.info("Initializing RAG System Manager...")
         logging.info(f"Qdrant location: {qdrant_location}")
         logging.info(f"Collection name: {collection_name}")
         logging.info(f"Embedding model: {EMBEDDING_MODEL_NAME}")
@@ -271,7 +280,7 @@ class RAGSystemManager:
                     "### 📈 METRIC COMPARISON TABLE\n"
                     "| Metric | Doc 1 | Doc 2 | Change | Status |\n"
                     "Present key metrics side-by-side.\n\n"
-                    "### 📴 NEW ISSUES (appeared in later reports)\n"
+                    "### 🔴 NEW ISSUES (appeared in later reports)\n"
                     "List any new problems that emerged.\n\n"
                     "### ✅ RESOLVED ISSUES (fixed since earlier reports)\n"
                     "List what improved.\n\n"
@@ -327,7 +336,7 @@ class RAGSystemManager:
                     "- Wait events: No single event should dominate > 50%\n\n"
                     "**STEP 3 - Issue Identification:**\n"
                     "List issues found:\n"
-                    "📴 CRITICAL: [issues requiring immediate attention]\n"
+                    "🔴 CRITICAL: [issues requiring immediate attention]\n"
                     "🟡 WARNING: [issues needing investigation]\n"
                     "ℹ️ INFO: [observations and recommendations]\n\n"
                     "**STEP 4 - Root Cause & Solutions:**\n"
@@ -347,7 +356,7 @@ class RAGSystemManager:
                     "Provide a comprehensive analysis in this format:\n\n"
                     "### 📊 EXECUTIVE SUMMARY\n"
                     "One paragraph: Overall health, main findings, severity level.\n\n"
-                    "### 📴 CRITICAL ISSUES (Immediate Attention Required)\n"
+                    "### 🔴 CRITICAL ISSUES (Immediate Attention Required)\n"
                     "For each critical issue:\n"
                     "**Issue:** [Name]\n"
                     "- **Metric:** [Specific value vs. expected]\n"
@@ -376,10 +385,8 @@ class RAGSystemManager:
         logging.warning(f"Unrecognized prompt_style: {prompt_style}. Using default.")
         return "You are an expert DBA assistant. Answer based on the provided context."
 
-    
     def answer_query(self, question: str, doc_ids: list, api_choice: str, api_key: str, model_name: str,
-                     enable_evaluation: bool = False, ground_truth: str = None, openai_eval_key: str = None,
-                     prompt_style: str = "Standard") -> dict:
+                     prompt_style: str = "Standard", ragas_enabled: bool = True) -> dict:
         """  
         Executes the RAG chain for both single-document queries and multi-document comparisons.
         
@@ -389,20 +396,19 @@ class RAGSystemManager:
             api_choice: LLM API provider
             api_key: API key for the LLM
             model_name: Model name to use
-            enable_evaluation: Whether to run RAGAS evaluation
-            ground_truth: Ground truth answer for evaluation
-            openai_eval_key: OpenAI API key for RAGAS evaluation
             prompt_style: Style of system prompt (Standard, Detailed Step-by-Step, Issue-Focused)
+            ragas_enabled: Whether to run RAGAS evaluation in background
         
         Returns:
-            dict: Contains answer, contexts, and optionally evaluation scores
+            dict: Contains answer, contexts, retrieved_docs_count, and evaluation_completed flag
         """
         logging.info("="*50)
         logging.info("ANSWERING QUERY")
         logging.info(f"Question: {question}")
         logging.info(f"Document IDs: {doc_ids}")
         logging.info(f"LLM: {api_choice} - {model_name}")
-        logging.info(f"Evaluation enabled: {enable_evaluation}")
+        logging.info(f"Prompt Style: {prompt_style}")
+        logging.info(f"RAGAS Evaluation: {'ENABLED' if ragas_enabled else 'DISABLED'}")
         
         # Validate inputs
         if not question or not isinstance(question, str) or not question.strip():
@@ -457,16 +463,14 @@ class RAGSystemManager:
         # Store contexts for evaluation
         contexts = [doc.page_content for doc in test_docs]
 
-        # Define prompt based on comparison requirement
+        # Get system instruction based on prompt style
         logging.info(f"Building RAG chain for {len(doc_ids)} document(s)...")
-        
         system_instruction = self._get_system_instruction(doc_ids, prompt_style)
         
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_instruction + "\n\nContext: {context}"),
             ("user", "{question}")
         ])
-
         
         # Define the RAG chain
         def format_docs(docs):
@@ -494,45 +498,76 @@ class RAGSystemManager:
                 "answer": answer,
                 "contexts": contexts,
                 "retrieved_docs_count": len(test_docs),
-                "error": False
+                "error": False,
+                "evaluation_completed": False
             }
 
-            # Run RAGAS evaluation if enabled
-            if enable_evaluation:
-                logging.info("Running RAGAS evaluation...")
-
-                # RAGAS REQUIRES AN OPENAI LLM (OR COMPATIBLE) FOR METRICS
-                if not openai_eval_key:
-                    logging.error("No OpenAI API key provided for RAGAS evaluation")
-                    result["evaluation"] = {"error": "OpenAI API key required for RAGAS evaluation"}
-                    logging.info("="*50)
-                    return result
-
-                # Initialize dedicated LLM for RAGAS
-                try:
-                    ragas_llm = get_openai_eval_llm(openai_eval_key)
-                except Exception as e:
-                    logging.error(f"RAGAS LLM initialization failed: {e}")
-                    result["evaluation"] = {"error": f"RAGAS LLM initialization failed: {e}"}
-                    logging.info("="*50)
-                    return result
-
-                logging.info(f"Using OpenAI API for RAGAS evaluation")
-
-                eval_scores = self.evaluate_with_ragas(
-                    question=question,
-                    answer=answer,
-                    contexts=contexts,
-                    ground_truth=ground_truth,
-                    llm=ragas_llm
-                )
-                result["evaluation"] = eval_scores
-                self.evaluation_results.append({
-                    "question": question,
-                    "answer": answer,
-                    "scores": eval_scores
-                })
-                logging.info(f"Evaluation complete: {eval_scores}")
+            # CONDITIONAL RAGAS EVALUATION
+            if ragas_enabled:
+                # Try to get RAGAS API key from environment or Streamlit secrets
+                ragas_key = os.getenv("RAGAS_OPENAI_KEY")
+                
+                if not ragas_key and STREAMLIT_AVAILABLE:
+                    try:
+                        ragas_key = st.secrets.get("RAGAS_OPENAI_KEY")
+                    except:
+                        pass
+                
+                if ragas_key:
+                    try:
+                        logging.info("Starting background RAGAS evaluation...")
+                        
+                        ragas_llm = get_openai_eval_llm(ragas_key)
+                        eval_scores = self.evaluate_with_ragas(
+                            question=question,
+                            answer=answer,
+                            contexts=contexts,
+                            ground_truth=None,
+                            llm=ragas_llm
+                        )
+                        
+                        # LOG TO MAIN LOG
+                        logging.info("="*70)
+                        logging.info("RAGAS BACKGROUND EVALUATION COMPLETED")
+                        logging.info(f"Scores: {eval_scores}")
+                        logging.info("="*70)
+                        
+                        # LOG TO RAGAS-SPECIFIC LOG
+                        ragas_logger.info("="*70)
+                        ragas_logger.info(f"Query: {question[:150]}...")
+                        ragas_logger.info(f"Model: {api_choice}/{model_name}")
+                        ragas_logger.info(f"Faithfulness: {eval_scores.get('faithfulness', 'N/A')}")
+                        ragas_logger.info(f"Answer Relevancy: {eval_scores.get('answer_relevancy', 'N/A')}")
+                        ragas_logger.info(f"Context Precision: {eval_scores.get('context_precision', 'N/A')}")
+                        ragas_logger.info(f"Context Recall: {eval_scores.get('context_recall', 'N/A')}")
+                        ragas_logger.info(f"Answer Length: {len(answer)} chars")
+                        ragas_logger.info(f"Contexts Retrieved: {len(contexts)}")
+                        ragas_logger.info(f"Timestamp: {datetime.now().isoformat()}")
+                        ragas_logger.info("="*70)
+                        
+                        # Store in memory for potential analytics
+                        self.evaluation_results.append({
+                            "timestamp": datetime.now().isoformat(),
+                            "question": question,
+                            "model": f"{api_choice}/{model_name}",
+                            "scores": eval_scores,
+                            "context_count": len(contexts),
+                            "answer_length": len(answer)
+                        })
+                        
+                        result["evaluation_completed"] = True
+                        
+                    except Exception as e:
+                        logging.error(f"Background RAGAS evaluation failed: {e}")
+                        ragas_logger.error(f"Evaluation failed for query '{question[:50]}...': {e}")
+                        result["evaluation_completed"] = False
+                else:
+                    logging.warning("RAGAS enabled but RAGAS_OPENAI_KEY not configured")
+                    ragas_logger.warning("RAGAS evaluation skipped - API key not configured")
+                    result["evaluation_completed"] = False
+            else:
+                logging.info("RAGAS evaluation skipped (disabled by user)")
+                result["evaluation_completed"] = False
             
             logging.info("="*50)
             return result
